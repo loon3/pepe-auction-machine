@@ -10,19 +10,21 @@ class BitcoinRPCClient:
     
     def __init__(self):
         self.connection = None
+        self._connection_url = None
     
     def _get_connection(self):
         """Get or create RPC connection"""
-        if self.connection is None:
-            rpc_user = current_app.config['BITCOIN_RPC_USER']
-            rpc_password = current_app.config['BITCOIN_RPC_PASSWORD']
-            rpc_host = current_app.config['BITCOIN_RPC_HOST']
-            rpc_port = current_app.config['BITCOIN_RPC_PORT']
-            
-            rpc_url = f"http://{rpc_user}:{rpc_password}@{rpc_host}:{rpc_port}"
-            self.connection = AuthServiceProxy(rpc_url)
+        # Always create a fresh connection URL from config
+        rpc_user = current_app.config['BITCOIN_RPC_USER']
+        rpc_password = current_app.config['BITCOIN_RPC_PASSWORD']
+        rpc_host = current_app.config['BITCOIN_RPC_HOST']
+        rpc_port = current_app.config['BITCOIN_RPC_PORT']
         
-        return self.connection
+        rpc_url = f"http://{rpc_user}:{rpc_password}@{rpc_host}:{rpc_port}"
+        
+        # Create a new connection for each call to avoid thread safety issues
+        # AuthServiceProxy connections should not be shared across threads
+        return AuthServiceProxy(rpc_url)
     
     def get_current_block_height(self):
         """Get current blockchain height"""
@@ -40,15 +42,24 @@ class BitcoinRPCClient:
         Returns None if UTXO doesn't exist or is spent
         """
         try:
+            logger.info(f"Calling Bitcoin RPC gettxout for {txid}:{vout} (vout type: {type(vout)})")
             rpc = self._get_connection()
             
+            # Ensure vout is an integer
+            if not isinstance(vout, int):
+                logger.warning(f"vout is not an integer: {vout} (type: {type(vout)}), converting...")
+                vout = int(vout)
+            
             # Get transaction output
+            logger.debug(f"Executing: gettxout('{txid}', {vout})")
             result = rpc.gettxout(txid, vout)
             
             if result is None:
                 # UTXO doesn't exist or is spent
+                logger.warning(f"gettxout returned None for {txid}:{vout} (UTXO doesn't exist or is spent)")
                 return None
             
+            logger.info(f"Successfully retrieved UTXO {txid}:{vout}, confirmations: {result.get('confirmations', 0)}")
             return {
                 'txid': txid,
                 'vout': vout,
@@ -57,8 +68,16 @@ class BitcoinRPCClient:
                 'confirmations': result.get('confirmations', 0)
             }
         except JSONRPCException as e:
-            logger.error(f"Error getting UTXO {txid}:{vout}: {e}")
-            raise Exception(f"Failed to get UTXO: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"JSONRPCException getting UTXO {txid}:{vout}: {error_msg}", exc_info=True)
+            
+            # Check for common error cases
+            if "Request-sent" in error_msg or "not yet confirmed" in error_msg:
+                raise Exception("UTXO transaction is not yet confirmed. Please wait for at least 1 confirmation before creating an auction.")
+            elif "No such mempool or blockchain transaction" in error_msg:
+                raise Exception("Transaction not found. Please verify the transaction ID is correct and has been broadcast.")
+            else:
+                raise Exception(f"Failed to get UTXO: {error_msg}")
     
     def is_utxo_spent(self, txid, vout):
         """
@@ -67,6 +86,59 @@ class BitcoinRPCClient:
         """
         utxo = self.get_utxo(txid, vout)
         return utxo is None
+    
+    def check_utxos_batch(self, utxo_list, batch_size=50):
+        """
+        Check multiple UTXOs in batches using RPC batch requests
+        
+        Args:
+            utxo_list: List of (txid, vout) tuples to check
+            batch_size: Maximum number of UTXOs per batch (default 50)
+            
+        Returns:
+            dict: {(txid, vout): is_spent, ...}
+            - is_spent is True if UTXO is spent/doesn't exist, False if unspent
+        """
+        if not utxo_list:
+            return {}
+        
+        results = {}
+        
+        # Split into batches
+        for i in range(0, len(utxo_list), batch_size):
+            batch = utxo_list[i:i + batch_size]
+            
+            try:
+                rpc = self._get_connection()
+                
+                logger.debug(f"Batch checking {len(batch)} UTXOs")
+                
+                # Execute batch request using batch_ with list of call lists
+                # Format: [['method_name', param1, param2], ...]
+                # Must be lists, not tuples, because library calls .pop()
+                batch_calls = [['gettxout', txid, vout] for txid, vout in batch]
+                batch_results = rpc.batch_(batch_calls)
+                
+                # Process results
+                for (txid, vout), result in zip(batch, batch_results):
+                    # result is None if UTXO is spent or doesn't exist
+                    is_spent = (result is None)
+                    results[(txid, vout)] = is_spent
+                    
+            except Exception as e:
+                logger.error(f"Error in batch UTXO check: {str(e)}", exc_info=True)
+                # Fall back to individual checks for this batch
+                logger.info(f"Falling back to individual checks for batch of {len(batch)} UTXOs")
+                for txid, vout in batch:
+                    try:
+                        is_spent = self.is_utxo_spent(txid, vout)
+                        results[(txid, vout)] = is_spent
+                    except Exception as e2:
+                        logger.error(f"Error checking UTXO {txid}:{vout}: {str(e2)}")
+                        # Skip this UTXO if we can't check it
+                        continue
+        
+        return results
     
     def get_transaction(self, txid):
         """

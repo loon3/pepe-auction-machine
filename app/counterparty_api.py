@@ -39,14 +39,20 @@ class CounterpartyAPIClient:
             logger.info(f"Requesting Counterparty balances from: {url}")
             
             response = requests.get(url, timeout=10)
+            
+            logger.info(f"Counterparty API response status: {response.status_code}")
+            
             response.raise_for_status()
             
             data = response.json()
+            logger.debug(f"Counterparty API response data: {data}")
             
             result_list = data.get('result', [])
             
             # Check if it's a single asset
             single_asset = len(result_list) == 1
+            
+            logger.info(f"Found {len(result_list)} asset(s) on UTXO {txid}:{vout}")
             
             return {
                 'assets': result_list,
@@ -55,7 +61,7 @@ class CounterpartyAPIClient:
             }
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting UTXO balances for {txid}:{vout}: {e}")
+            logger.error(f"RequestException getting UTXO balances for {txid}:{vout}: {e}", exc_info=True)
             return {
                 'assets': [],
                 'single_asset': False,

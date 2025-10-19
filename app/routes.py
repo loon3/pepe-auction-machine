@@ -41,6 +41,9 @@ def create_auction():
     - utxo_vout: integer
     - start_block: integer
     - end_block: integer
+    - start_price_sats: integer (highest price)
+    - end_price_sats: integer (lowest price)
+    - price_decrement: integer (price decrease per block)
     - blocks_after_end: integer
     - psbts: list of {block_number, price_sats, psbt_data}
     """
@@ -57,15 +60,18 @@ def create_auction():
             logger.warning(f"Validation failed: {str(e)}")
             return jsonify({'error': str(e)}), 400
         
-        # Check if auction already exists for this UTXO
-        existing_auction = Auction.query.filter_by(
+        # Check if an active/relevant auction already exists for this UTXO
+        # Only block if there's an auction that isn't finished (expired, sold, closed are OK to replace)
+        existing_active_auction = Auction.query.filter_by(
             utxo_txid=validated_data['utxo_txid'],
             utxo_vout=validated_data['utxo_vout']
+        ).filter(
+            Auction.status.in_(['upcoming', 'active', 'finished'])
         ).first()
         
-        if existing_auction:
+        if existing_active_auction:
             return jsonify({
-                'error': f"Auction already exists for UTXO {validated_data['utxo_txid']}:{validated_data['utxo_vout']}"
+                'error': f"Active auction already exists for UTXO {validated_data['utxo_txid']}:{validated_data['utxo_vout']} with status '{existing_active_auction.status}'. Wait for it to expire before creating a new auction."
             }), 409
         
         # Create auction
@@ -76,6 +82,9 @@ def create_auction():
             utxo_vout=validated_data['utxo_vout'],
             start_block=validated_data['start_block'],
             end_block=validated_data['end_block'],
+            start_price_sats=validated_data['start_price_sats'],
+            end_price_sats=validated_data['end_price_sats'],
+            price_decrement=validated_data['price_decrement'],
             blocks_after_end=validated_data['blocks_after_end'],
             status='upcoming'
         )
@@ -130,10 +139,78 @@ def list_auctions():
         
         auctions = query.order_by(Auction.created_at.desc()).all()
         
+        # Get current block height
+        try:
+            current_block = bitcoin_rpc.get_current_block_height()
+        except Exception as e:
+            logger.warning(f"Could not get current block height: {str(e)}")
+            current_block = None
+        
+        # Build auction list with current PSBT data for active auctions
+        auction_list = []
+        for auction in auctions:
+            auction_data = auction.to_dict()
+            
+            # Add current PSBT data and price based on auction status
+            if current_block and auction.status == 'active':
+                # Active: return PSBT for current block
+                if current_block <= auction.end_block:
+                    target_block = current_block
+                else:
+                    # Auction ended but still active (shouldn't happen, but be safe)
+                    target_block = auction.end_block
+                
+                # Get the PSBT for the current block
+                current_psbt = PSBT.query.filter_by(
+                    auction_id=auction.id,
+                    block_number=target_block
+                ).first()
+                
+                if current_psbt:
+                    auction_data['current_psbt_data'] = current_psbt.psbt_data
+                    auction_data['current_price_sats'] = current_psbt.price_sats
+                else:
+                    auction_data['current_psbt_data'] = None
+                    auction_data['current_price_sats'] = None
+            elif auction.status == 'finished':
+                # Finished: show the final (lowest) price PSBT
+                # Buyers can still purchase during cleanup window
+                final_psbt = PSBT.query.filter_by(
+                    auction_id=auction.id,
+                    block_number=auction.end_block
+                ).first()
+                
+                if final_psbt:
+                    auction_data['current_psbt_data'] = final_psbt.psbt_data
+                    auction_data['current_price_sats'] = final_psbt.price_sats
+                else:
+                    auction_data['current_psbt_data'] = None
+                    auction_data['current_price_sats'] = auction.end_price_sats
+            elif auction.status == 'expired':
+                # Expired: cleanup window passed, no PSBT
+                auction_data['current_psbt_data'] = None
+                auction_data['current_price_sats'] = auction.end_price_sats
+            elif auction.status == 'upcoming':
+                # For upcoming auctions, show the start price (no PSBT yet)
+                auction_data['current_psbt_data'] = None
+                auction_data['current_price_sats'] = auction.start_price_sats
+            elif auction.status == 'sold':
+                # For sold auctions, try to determine the sale price from the PSBT
+                # Find which PSBT was used (this is simplified)
+                auction_data['current_psbt_data'] = None
+                auction_data['current_price_sats'] = None  # Could be enhanced to find actual sale price
+            else:
+                # For closed or other statuses
+                auction_data['current_psbt_data'] = None
+                auction_data['current_price_sats'] = None
+            
+            auction_list.append(auction_data)
+        
         return jsonify({
             'success': True,
-            'count': len(auctions),
-            'auctions': [auction.to_dict() for auction in auctions]
+            'current_block': current_block,
+            'count': len(auction_list),
+            'auctions': auction_list
         }), 200
         
     except Exception as e:

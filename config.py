@@ -13,7 +13,9 @@ class Config:
     
     # Database Configuration
     DATABASE_PATH = os.getenv('DATABASE_PATH', './data/auctions.db')
-    SQLALCHEMY_DATABASE_URI = f'sqlite:///{DATABASE_PATH}'
+    # Convert to absolute path for SQLAlchemy
+    _db_path_absolute = os.path.abspath(DATABASE_PATH)
+    SQLALCHEMY_DATABASE_URI = f'sqlite:///{_db_path_absolute}'
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     
     # Bitcoin Core RPC Configuration

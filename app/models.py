@@ -11,6 +11,9 @@ class Auction(db.Model):
     utxo_vout = db.Column(db.Integer, nullable=False)
     start_block = db.Column(db.Integer, nullable=False)
     end_block = db.Column(db.Integer, nullable=False)
+    start_price_sats = db.Column(db.BigInteger, nullable=False)
+    end_price_sats = db.Column(db.BigInteger, nullable=False)
+    price_decrement = db.Column(db.BigInteger, nullable=False)
     blocks_after_end = db.Column(db.Integer, nullable=False, default=144)
     status = db.Column(db.String(20), nullable=False, default='upcoming')  # upcoming, active, sold, closed, finished, expired
     purchase_txid = db.Column(db.String(64), nullable=True)
@@ -20,10 +23,8 @@ class Auction(db.Model):
     # Relationship to PSBTs
     psbts = db.relationship('PSBT', backref='auction', lazy=True, cascade='all, delete-orphan')
     
-    # Add unique constraint on UTXO
-    __table_args__ = (
-        db.UniqueConstraint('utxo_txid', 'utxo_vout', name='unique_utxo'),
-    )
+    # Note: No unique constraint on UTXO to allow creating new auctions after expiration
+    # Uniqueness is enforced in application code for active/relevant auctions only
     
     def to_dict(self, include_psbts=False):
         """Convert auction to dictionary for API responses"""
@@ -35,6 +36,9 @@ class Auction(db.Model):
             'utxo_vout': self.utxo_vout,
             'start_block': self.start_block,
             'end_block': self.end_block,
+            'start_price_sats': self.start_price_sats,
+            'end_price_sats': self.end_price_sats,
+            'price_decrement': self.price_decrement,
             'blocks_after_end': self.blocks_after_end,
             'status': self.status,
             'purchase_txid': self.purchase_txid,

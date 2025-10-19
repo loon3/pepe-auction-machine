@@ -70,6 +70,9 @@ PAYLOAD='{
   "utxo_vout": 0,
   "start_block": 900000,
   "end_block": 900005,
+  "start_price_sats": 100000,
+  "end_price_sats": 75000,
+  "price_decrement": 5000,
   "blocks_after_end": 144,
   "psbts": [
     {

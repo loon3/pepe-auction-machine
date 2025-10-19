@@ -53,16 +53,19 @@ def validate_utxo_exists(txid, vout):
         ValidationError if UTXO doesn't exist or is spent
     """
     try:
+        logger.info(f"Validating UTXO exists: {txid}:{vout} (txid type: {type(txid)}, vout type: {type(vout)})")
         utxo = bitcoin_rpc.get_utxo(txid, vout)
         
         if utxo is None:
             raise ValidationError(f"UTXO {txid}:{vout} does not exist or is already spent")
         
+        logger.info(f"UTXO {txid}:{vout} validated successfully, confirmations: {utxo.get('confirmations', 0)}")
         return utxo
         
     except ValidationError:
         raise
     except Exception as e:
+        logger.error(f"Error validating UTXO {txid}:{vout}: {str(e)}", exc_info=True)
         raise ValidationError(f"Error validating UTXO: {str(e)}")
 
 
@@ -194,7 +197,8 @@ def validate_auction_submission(data):
     # Validate required fields
     required_fields = [
         'asset_name', 'asset_qty', 'utxo_txid', 'utxo_vout',
-        'start_block', 'end_block', 'blocks_after_end', 'psbts'
+        'start_block', 'end_block', 'start_price_sats', 'end_price_sats',
+        'price_decrement', 'blocks_after_end', 'psbts'
     ]
     
     for field in required_fields:
@@ -220,8 +224,47 @@ def validate_auction_submission(data):
     if data['end_block'] <= data['start_block']:
         raise ValidationError("end_block must be greater than start_block")
     
+    # Validate that start_block is in the future
+    try:
+        current_block = bitcoin_rpc.get_current_block_height()
+        if data['start_block'] <= current_block:
+            raise ValidationError(
+                f"start_block ({data['start_block']}) must be after current block ({current_block}). "
+                f"Auctions cannot start in the past or present."
+            )
+    except ValidationError:
+        raise
+    except Exception as e:
+        logger.error(f"Could not validate start_block against current block: {str(e)}")
+        # Continue without this validation if we can't get current block
+        pass
+    
     if not isinstance(data['blocks_after_end'], int) or data['blocks_after_end'] < 0:
         raise ValidationError("blocks_after_end must be a non-negative integer")
+    
+    if not isinstance(data['start_price_sats'], int) or data['start_price_sats'] <= 0:
+        raise ValidationError("start_price_sats must be a positive integer")
+    
+    if not isinstance(data['end_price_sats'], int) or data['end_price_sats'] <= 0:
+        raise ValidationError("end_price_sats must be a positive integer")
+    
+    if data['end_price_sats'] >= data['start_price_sats']:
+        raise ValidationError("end_price_sats must be less than start_price_sats (Dutch auction)")
+    
+    if not isinstance(data['price_decrement'], int) or data['price_decrement'] <= 0:
+        raise ValidationError("price_decrement must be a positive integer")
+    
+    # Validate that price_decrement is consistent with start/end prices and block range
+    expected_total_decrease = data['start_price_sats'] - data['end_price_sats']
+    num_decrements = data['end_block'] - data['start_block']
+    expected_decrement = expected_total_decrease / num_decrements
+    
+    # Allow for rounding, but price_decrement should be close to expected
+    if abs(data['price_decrement'] - expected_decrement) > num_decrements:
+        raise ValidationError(
+            f"price_decrement ({data['price_decrement']}) doesn't match expected value "
+            f"(~{expected_decrement:.2f} based on price range and block count)"
+        )
     
     if not isinstance(data['psbts'], list) or len(data['psbts']) == 0:
         raise ValidationError("psbts must be a non-empty list")
@@ -257,6 +300,21 @@ def validate_auction_submission(data):
     
     # Validate block range coverage
     validate_block_range(data['psbts'], data['start_block'], data['end_block'])
+    
+    # Validate that first PSBT matches start_price_sats
+    sorted_psbts = sorted(data['psbts'], key=lambda x: x['block_number'])
+    first_psbt = sorted_psbts[0]
+    if first_psbt['price_sats'] != data['start_price_sats']:
+        raise ValidationError(
+            f"First PSBT price ({first_psbt['price_sats']}) must match start_price_sats ({data['start_price_sats']})"
+        )
+    
+    # Validate that last PSBT matches end_price_sats
+    last_psbt = sorted_psbts[-1]
+    if last_psbt['price_sats'] != data['end_price_sats']:
+        raise ValidationError(
+            f"Last PSBT price ({last_psbt['price_sats']}) must match end_price_sats ({data['end_price_sats']})"
+        )
     
     logger.info(f"Successfully validated auction for {data['asset_name']} at {data['utxo_txid']}:{data['utxo_vout']}")
     

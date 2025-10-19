@@ -106,6 +106,9 @@ curl -X POST http://localhost:5000/api/auctions \
     "utxo_vout": 0,
     "start_block": 850000,
     "end_block": 850010,
+    "start_price_sats": 100000,
+    "end_price_sats": 50000,
+    "price_decrement": 5000,
     "blocks_after_end": 144,
     "psbts": [
       {
