@@ -8,61 +8,63 @@ upcoming → active → finished → expired
            sold/closed
 ```
 
-## Status Definitions with TXID Values
+## Status Definitions
 
-| Status | Description | purchase_txid | closed_txid | When |
-|--------|-------------|---------------|-------------|------|
-| **upcoming** | Auction not started yet | `null` | `null` | current_block < start_block |
-| **active** | Auction in progress | `null` | `null` | start_block ≤ current_block ≤ end_block |
-| **sold** | UTXO spent via PSBT | **set** | `null` | UTXO spent matching PSBT price |
-| **closed** | UTXO spent not via PSBT | `null` | **set** | UTXO spent, doesn't match PSBT |
-| **finished** | Auction ended, not sold | `null` | `null` | end_block < current_block < end_block + blocks_after_end |
-| **expired** | Cleanup window passed | `null` | `null` | current_block ≥ end_block + blocks_after_end |
+| Status | Description | spent_txid | When |
+|--------|-------------|------------|------|
+| **upcoming** | Auction not started yet | `null` | current_block < start_block |
+| **active** | Auction in progress | `null` | start_block ≤ current_block ≤ end_block |
+| **sold** | UTXO spent via PSBT | **set** | UTXO spent matching PSBT price |
+| **closed** | UTXO spent not via PSBT | **set** | UTXO spent, doesn't match PSBT |
+| **finished** | Auction ended, not sold | `null` | end_block < current_block < end_block + blocks_after_end |
+| **expired** | Cleanup window passed | `null` | current_block ≥ end_block + blocks_after_end |
+
+**Note:** Both `sold` and `closed` statuses use `spent_txid` to store the transaction that spent the UTXO. The status itself indicates whether it was a PSBT purchase (`sold`) or other spend (`closed`).
 
 ## Status Transitions
 
 ### Normal Flow (No Sale)
 
 ```
-upcoming (both null)
+upcoming (spent_txid null)
     ↓
-active (both null)
+active (spent_txid null)
     ↓
-finished (both null)  ← Still showing final PSBT
+finished (spent_txid null)  ← Still showing final PSBT
     ↓
-expired (both null)   ← No longer showing PSBT
+expired (spent_txid null)   ← No longer showing PSBT
 ```
 
 ### Sold During Auction
 
 ```
-upcoming (both null)
+upcoming (spent_txid null)
     ↓
-active (both null)
+active (spent_txid null)
     ↓
-sold (purchase_txid set, closed_txid null)
+sold (spent_txid set, status='sold' indicates PSBT match)
 ```
 
 ### Seller Closes Manually
 
 ```
-upcoming (both null)
+upcoming (spent_txid null)
     ↓
-active (both null)
+active (spent_txid null)
     ↓
-closed (purchase_txid null, closed_txid set)
+closed (spent_txid set, status='closed' indicates non-PSBT spend)
 ```
 
 ### Sold After Auction Ends
 
 ```
-upcoming (both null)
+upcoming (spent_txid null)
     ↓
-active (both null)
+active (spent_txid null)
     ↓
-finished (both null)
+finished (spent_txid null)
     ↓
-sold (purchase_txid set, closed_txid null)
+sold (spent_txid set)
 ```
 
 ## Identifying Auction Outcomes
@@ -71,16 +73,16 @@ sold (purchase_txid set, closed_txid null)
 
 ```sql
 -- Unsold auctions still available
-SELECT * FROM auctions WHERE status = 'finished' AND purchase_txid IS NULL AND closed_txid IS NULL;
+SELECT * FROM auctions WHERE status = 'finished' AND spent_txid IS NULL;
 
 -- Unsold auctions past cleanup
-SELECT * FROM auctions WHERE status = 'expired' AND purchase_txid IS NULL AND closed_txid IS NULL;
+SELECT * FROM auctions WHERE status = 'expired' AND spent_txid IS NULL;
 
 -- Sold auctions
-SELECT * FROM auctions WHERE status = 'sold' AND purchase_txid IS NOT NULL;
+SELECT * FROM auctions WHERE status = 'sold';
 
 -- Seller-closed auctions
-SELECT * FROM auctions WHERE status = 'closed' AND closed_txid IS NOT NULL;
+SELECT * FROM auctions WHERE status = 'closed';
 
 -- Active auctions available now
 SELECT * FROM auctions WHERE status = 'active';
@@ -91,16 +93,18 @@ SELECT * FROM auctions WHERE status = 'upcoming';
 
 ## API Endpoint Behavior
 
-### GET /api/auctions/{id}/current-psbt
+### GET /api/listings/{id}
 
-| Status | Returns PSBT? | Notes |
-|--------|---------------|-------|
-| upcoming | No | Returns message: "Auction has not started yet" |
-| active | Yes | Returns PSBT for current block |
-| sold | No | Returns message: "Auction is sold" |
-| closed | No | Returns message: "Auction is closed" |
-| finished | Yes | Returns final (lowest price) PSBT |
-| expired | No | Returns message: "Auction has ended and is in cleanup period" |
+Returns listing metadata. The `status` field indicates the current state, and `spent_txid` is populated when the UTXO has been spent.
+
+| Status | spent_txid | Notes |
+|--------|------------|-------|
+| upcoming | null | Auction has not started yet |
+| active | null | Auction in progress, PSBT available |
+| sold | set | Purchased via PSBT |
+| closed | set | Spent but not via PSBT |
+| finished | null | Ended but still in cleanup window |
+| expired | null | Past cleanup window |
 
 ## Background Monitor Behavior
 
@@ -124,13 +128,13 @@ Checks current block height and updates statuses:
 
 Checks if auction UTXOs have been spent:
 
-1. Queries all auctions with status: `upcoming`, `active`, `finished`, `expired`
+1. Queries all auctions with status: `upcoming`, `active`, `finished`
 2. For each auction, checks if UTXO is spent
 3. If spent:
    - Gets spending transaction
    - Checks if transaction output value matches any PSBT price
-   - If matches: status → `sold`, set `purchase_txid`
-   - If doesn't match: status → `closed`, set `closed_txid`
+   - If matches: status → `sold`, set `spent_txid`, `spent_block`, `spent_at`, `recipient`
+   - If doesn't match: status → `closed`, set `spent_txid`, `spent_block`, `spent_at`, `recipient`
 
 ## Use Cases
 

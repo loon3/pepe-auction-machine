@@ -6,6 +6,7 @@ import os
 import logging
 from app import create_app, db
 from app.monitors import auction_monitor
+from app.zmq_listener import zmq_listener
 
 # Configure logging
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -19,8 +20,9 @@ logger = logging.getLogger(__name__)
 # Create Flask app
 app = create_app()
 
-# Initialize monitoring with app context
+# Initialize monitoring and ZMQ listener with app context
 auction_monitor.init_app(app)
+zmq_listener.init_app(app)
 
 # Start background monitoring
 with app.app_context():
@@ -35,9 +37,19 @@ with app.app_context():
     db.create_all()
     logger.info("Database tables created/verified")
     
-    # Start monitoring
+    # Start polling-based monitoring (fallback)
     auction_monitor.start()
-    logger.info("Background monitoring started")
+    logger.info("Background polling monitors started (5 min intervals)")
+    
+    # Start ZMQ listener for real-time notifications (primary)
+    if app.config.get('ZMQ_ENABLED', True):
+        zmq_listener.start(
+            on_new_block=auction_monitor.trigger_block_check,
+            on_new_tx=auction_monitor.check_transaction_for_utxos
+        )
+        logger.info("ZMQ real-time notifications started")
+    else:
+        logger.info("ZMQ notifications disabled, using polling only")
 
 if __name__ == '__main__':
     try:
@@ -54,9 +66,11 @@ if __name__ == '__main__':
         )
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+        zmq_listener.stop()
         auction_monitor.stop()
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
+        zmq_listener.stop()
         auction_monitor.stop()
         raise
 

@@ -111,7 +111,9 @@ class BitcoinRPCClient:
             try:
                 rpc = self._get_connection()
                 
-                logger.debug(f"Batch checking {len(batch)} UTXOs")
+                # Log which UTXOs are being checked
+                utxo_list_str = ", ".join([f"{txid[:8]}...:{vout}" for txid, vout in batch])
+                logger.info(f"Batch checking {len(batch)} UTXOs: {utxo_list_str}")
                 
                 # Execute batch request using batch_ with list of call lists
                 # Format: [['method_name', param1, param2], ...]
@@ -156,11 +158,148 @@ class BitcoinRPCClient:
             logger.error(f"Error getting transaction {txid}: {e}")
             return None
     
+    def get_transaction_details(self, txid):
+        """
+        Get transaction details including block height and timestamp
+        
+        Args:
+            txid: Transaction ID
+            
+        Returns:
+            dict: {'block_height': int, 'timestamp': datetime} or None
+        """
+        try:
+            tx = self.get_transaction(txid)
+            
+            if not tx:
+                return None
+            
+            # Check if transaction is confirmed
+            confirmations = tx.get('confirmations', 0)
+            if confirmations == 0:
+                logger.debug(f"Transaction {txid} not yet confirmed")
+                return None
+            
+            result = {}
+            
+            # Get block height (blockhash indicates it's in a block)
+            if 'blockhash' in tx:
+                # Calculate block height from current height - confirmations + 1
+                current_height = self.get_current_block_height()
+                block_height = current_height - confirmations + 1
+                result['block_height'] = block_height
+            else:
+                result['block_height'] = None
+            
+            # Get timestamp (blocktime is Unix timestamp)
+            if 'blocktime' in tx:
+                from datetime import datetime
+                result['timestamp'] = datetime.utcfromtimestamp(tx['blocktime'])
+            elif 'time' in tx:
+                from datetime import datetime
+                result['timestamp'] = datetime.utcfromtimestamp(tx['time'])
+            else:
+                result['timestamp'] = None
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting transaction details for {txid}: {e}")
+            return None
+    
+    def get_recipient_address(self, txid):
+        """
+        Get the recipient address from a transaction (first non-OP_RETURN output)
+        
+        Args:
+            txid: Transaction ID
+            
+        Returns:
+            str: Recipient address or None if not found
+        """
+        try:
+            tx = self.get_transaction(txid)
+            
+            if not tx or 'vout' not in tx:
+                return None
+            
+            # Find first non-OP_RETURN output
+            for vout in tx['vout']:
+                script_pub_key = vout.get('scriptPubKey', {})
+                script_type = script_pub_key.get('type', '')
+                
+                # Skip OP_RETURN outputs
+                if script_type == 'nulldata':
+                    continue
+                
+                # Try to get address (newer format)
+                if 'address' in script_pub_key:
+                    return script_pub_key['address']
+                
+                # Try legacy format
+                if 'addresses' in script_pub_key and len(script_pub_key['addresses']) > 0:
+                    return script_pub_key['addresses'][0]
+            
+            logger.warning(f"No recipient address found in transaction {txid}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting recipient address for {txid}: {e}")
+            return None
+    
+    def get_address_from_utxo(self, txid, vout):
+        """
+        Get the address that controls a specific UTXO
+        
+        Args:
+            txid: Transaction ID
+            vout: Output index
+            
+        Returns:
+            str: Address controlling the UTXO or None if not found
+        """
+        try:
+            tx = self.get_transaction(txid)
+            
+            if not tx or 'vout' not in tx:
+                logger.warning(f"Could not get transaction {txid}")
+                return None
+            
+            # Check if vout index is valid
+            if vout >= len(tx['vout']):
+                logger.warning(f"vout {vout} out of range for transaction {txid}")
+                return None
+            
+            # Get the output at the specified index
+            output = tx['vout'][vout]
+            script_pub_key = output.get('scriptPubKey', {})
+            
+            # Try to get address (newer format)
+            if 'address' in script_pub_key:
+                return script_pub_key['address']
+            
+            # Try legacy format
+            if 'addresses' in script_pub_key and len(script_pub_key['addresses']) > 0:
+                return script_pub_key['addresses'][0]
+            
+            logger.warning(f"No address found for UTXO {txid}:{vout}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting address for UTXO {txid}:{vout}: {e}")
+            return None
+    
     def find_spending_transaction(self, txid, vout):
         """
         Find the transaction that spent a specific UTXO
         Returns transaction ID if found, None otherwise
-        Note: This requires txindex=1 in Bitcoin Core
+        
+        Tries multiple methods in order:
+        1. gettxspendingprevout (Bitcoin Core 24.0+, works without wallet)
+        2. getspentinfo (requires spentindex=1)
+        3. listreceivedbyaddress (requires wallet, fallback)
+        
+        Note: Works best with txindex=1 in Bitcoin Core
         """
         try:
             rpc = self._get_connection()
@@ -169,28 +308,53 @@ class BitcoinRPCClient:
             if not self.is_utxo_spent(txid, vout):
                 return None
             
+            # Method 1: Try gettxspendingprevout (Bitcoin Core 24.0+)
+            # This works without a wallet and is the most efficient method
+            try:
+                prevout = {"txid": txid, "vout": vout}
+                result = rpc.gettxspendingprevout([prevout])
+                
+                if result and len(result) > 0:
+                    spent_info = result[0]
+                    if 'spendingtxid' in spent_info and spent_info.get('spendingtxid'):
+                        spending_txid = spent_info['spendingtxid']
+                        logger.info(f"Found spending transaction using gettxspendingprevout: {spending_txid}")
+                        return spending_txid
+            except JSONRPCException as e:
+                logger.debug(f"gettxspendingprevout not available: {e}")
+            
+            # Method 2: Try getspentinfo (requires spentindex=1)
+            try:
+                spent_info = rpc.getspentinfo({"txid": txid, "index": vout})
+                if spent_info and 'txid' in spent_info:
+                    spending_txid = spent_info['txid']
+                    logger.info(f"Found spending transaction using getspentinfo: {spending_txid}")
+                    return spending_txid
+            except JSONRPCException as e:
+                logger.debug(f"getspentinfo not available: {e}")
+            
+            # Method 3: Try listreceivedbyaddress (requires wallet)
             # Get the original transaction to find the address
             tx = self.get_transaction(txid)
             if not tx or vout >= len(tx['vout']):
+                logger.warning(f"Could not get transaction {txid} or vout {vout} out of range")
                 return None
             
             # Get the scriptPubKey and address
             vout_data = tx['vout'][vout]
+            # Try both 'addresses' (legacy) and 'address' (newer format)
             addresses = vout_data['scriptPubKey'].get('addresses', [])
+            if not addresses and 'address' in vout_data['scriptPubKey']:
+                addresses = [vout_data['scriptPubKey']['address']]
             
             if not addresses:
-                # Can't search without an address
-                logger.warning(f"No address found for UTXO {txid}:{vout}")
+                logger.warning(f"No address found for UTXO {txid}:{vout}, cannot use wallet-based search")
                 return None
             
             address = addresses[0]
             
-            # Search for transactions involving this address
-            # This is a simplified approach - in production you might want to use
-            # a more efficient method like maintaining a database of spent UTXOs
             try:
-                # Get list of transactions for the address
-                # Note: This requires addressindex=1 in Bitcoin Core or using getaddressinfo
+                # This requires a loaded wallet
                 received_by_address = rpc.listreceivedbyaddress(0, True, True, address)
                 
                 if received_by_address:
@@ -203,12 +367,13 @@ class BitcoinRPCClient:
                                     # Check if this transaction has our UTXO as an input
                                     for vin in spending_tx['vin']:
                                         if vin.get('txid') == txid and vin.get('vout') == vout:
+                                            logger.info(f"Found spending transaction using listreceivedbyaddress: {spending_txid}")
                                             return spending_txid
-            except JSONRPCException:
-                # Method might not be available, try alternative approach
-                pass
+            except JSONRPCException as e:
+                logger.debug(f"listreceivedbyaddress not available (likely no wallet loaded): {e}")
             
-            logger.warning(f"Could not find spending transaction for {txid}:{vout}")
+            logger.warning(f"Could not find spending transaction for {txid}:{vout} using any available method")
+            logger.warning(f"Consider enabling spentindex=1 in Bitcoin Core or use a block explorer")
             return None
             
         except JSONRPCException as e:

@@ -27,37 +27,46 @@ A Dutch auction is a descending price auction where:
 ## Architecture Components
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Auction Machine                          │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │              Flask API (routes.py)                     │  │
-│  │  - POST /api/auctions (create auction)                │  │
-│  │  - GET  /api/auctions (list auctions)                 │  │
-│  │  - GET  /api/auctions/{id} (get details)              │  │
-│  │  - GET  /api/auctions/{id}/current-psbt (get PSBT)    │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                            │                                  │
-│  ┌────────────────────┬────┴────┬──────────────────────┐    │
-│  │                    │         │                       │    │
-│  │  Validators        │ Models  │  Background Monitors  │    │
-│  │  - PSBT format    │  - Auction│  - Block monitor    │    │
-│  │  - UTXO exists    │  - PSBT   │  - UTXO monitor     │    │
-│  │  - Asset match    │           │                      │    │
-│  │  - Price descent  │           │                      │    │
-│  └────────┬───────────┴──────────┴──────┬───────────────┘    │
-│           │                              │                     │
-│  ┌────────┴───────────┐     ┌──────────┴──────────┐         │
-│  │  Bitcoin RPC       │     │  Counterparty API   │         │
-│  │  - Block height    │     │  - Asset validation │         │
-│  │  - UTXO lookup     │     │  - Balance check    │         │
-│  │  - TX monitoring   │     │                     │         │
-│  └────────┬───────────┘     └──────────┬──────────┘         │
-└───────────┼────────────────────────────┼────────────────────┘
-            │                            │
-      ┌─────┴────────┐          ┌───────┴────────┐
-      │ Bitcoin Core │          │ Counterparty   │
-      │    (RPC)     │          │  Core (API)    │
-      └──────────────┘          └────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Auction Machine                               │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │                   Flask API (routes.py)                         │  │
+│  │  - POST /api/auctions (create auction)                         │  │
+│  │  - GET  /api/auctions (list auctions)                          │  │
+│  │  - GET  /api/auctions/{id} (get details)                       │  │
+│  │  - GET  /api/auctions/{id}/current-psbt (get PSBT)             │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                │                                      │
+│  ┌─────────────────────────────┼─────────────────────────────────┐   │
+│  │                             │                                  │   │
+│  │  ┌──────────────┐  ┌───────┴───────┐  ┌────────────────────┐ │   │
+│  │  │  Validators  │  │    Models     │  │  Background Monitors│ │   │
+│  │  │  - PSBT fmt  │  │  - Auction    │  │  - Block (5m poll) │ │   │
+│  │  │  - UTXO      │  │  - PSBT       │  │  - UTXO (5m poll)  │ │   │
+│  │  │  - Asset     │  │               │  │                    │ │   │
+│  │  └──────────────┘  └───────────────┘  └─────────┬──────────┘ │   │
+│  │                                                  │            │   │
+│  │  ┌───────────────────────────────────────────────┴──────────┐│   │
+│  │  │              ZMQ Listener (zmq_listener.py)              ││   │
+│  │  │  - rawblock subscription → instant block detection       ││   │
+│  │  │  - rawtx subscription → instant UTXO spend detection     ││   │
+│  │  │  - Triggers monitors immediately on events               ││   │
+│  │  └──────────────────────────────────────────────────────────┘│   │
+│  └───────────────────────────────────────────────────────────────┘   │
+│                    │                              │                   │
+│  ┌─────────────────┴──────────┐     ┌────────────┴────────────┐     │
+│  │       Bitcoin RPC          │     │    Counterparty API     │     │
+│  │  - Block height            │     │    - Asset validation   │     │
+│  │  - UTXO lookup             │     │    - Balance check      │     │
+│  │  - TX monitoring           │     │                         │     │
+│  └─────────────────┬──────────┘     └────────────┬────────────┘     │
+└────────────────────┼─────────────────────────────┼──────────────────┘
+                     │                             │
+       ┌─────────────┴─────────────┐     ┌────────┴────────┐
+       │       Bitcoin Core        │     │   Counterparty  │
+       │  - RPC (port 8332)        │     │   Core (API)    │
+       │  - ZMQ (ports 9332/9333)  │     │                 │
+       └───────────────────────────┘     └─────────────────┘
 ```
 
 ## Component Details
@@ -83,15 +92,18 @@ A Dutch auction is a descending price auction where:
 {
     id: integer (primary key)
     asset_name: string
-    asset_qty: integer
+    asset_qty: float  # Supports divisible assets (up to 8 decimals)
     utxo_txid: string
     utxo_vout: integer
     start_block: integer
     end_block: integer
     blocks_after_end: integer
-    status: enum (upcoming/active/sold/closed/finished)
-    purchase_txid: string (nullable)
-    closed_txid: string (nullable)
+    status: enum (upcoming/active/sold/closed/finished/expired)
+    spent_txid: string (nullable)  # Transaction that spent the UTXO
+    spent_block: integer (nullable)  # Block height when spent
+    spent_at: timestamp (nullable)  # Timestamp when spent
+    recipient: string (nullable)  # Recipient address
+    seller: string (nullable)  # Seller address
     created_at: timestamp
 }
 ```
@@ -142,18 +154,46 @@ GET http://{counterparty_host}:4000/v2/utxos/{txid}:{vout}/balances
 
 ### 6. Background Monitors (`monitors.py`)
 
-**Block Monitor (every 30 seconds):**
+The system uses a dual notification strategy:
+1. **ZMQ (primary)**: Real-time push notifications from Bitcoin Core
+2. **Polling (fallback)**: Periodic checks every 5 minutes to catch any missed events
+
+**Block Monitor (5 minute fallback polling):**
 - Gets current block height
 - Updates auction statuses:
   - `upcoming` → `active` when current_block >= start_block
   - `active` → `finished` when current_block > end_block
   - `finished` → `expired` when current_block >= end_block + blocks_after_end
 
-**UTXO Monitor (every 60 seconds):**
+**UTXO Monitor (5 minute fallback polling):**
 - Checks if auction UTXOs have been spent
 - Determines if spent via PSBT or otherwise:
-  - Via PSBT → status = `sold`, set purchase_txid
-  - Not via PSBT → status = `closed`, set closed_txid
+  - Via PSBT → status = `sold`, set spent_txid, recipient, spent_block, spent_at
+  - Not via PSBT → status = `closed`, set spent_txid, recipient, spent_block, spent_at
+
+**ZMQ Trigger Methods:**
+- `trigger_block_check()`: Called by ZMQ on new block for immediate status update
+- `trigger_utxo_check()`: Called by ZMQ when monitored UTXO is spent
+- `check_transaction_for_utxos()`: Parses raw tx to detect UTXO spends
+
+### 7. ZMQ Listener (`zmq_listener.py`)
+
+Real-time notification service that subscribes to Bitcoin Core's ZMQ endpoints.
+
+**Subscriptions:**
+- `rawblock` (port 9333): New block notifications → triggers immediate block check
+- `rawtx` (port 9332): New transaction notifications → checks if any monitored UTXO is spent
+
+**Features:**
+- Runs in separate daemon threads
+- Graceful shutdown with timeouts
+- Automatic reconnection handling
+- Raw transaction parsing to extract inputs
+- Thread-safe coordination with polling monitors
+
+**Performance:**
+- Block detection: < 1 second (vs 30 seconds with polling only)
+- UTXO spend detection: < 1 second (vs 60 seconds with polling only)
 
 ## Data Flow
 
@@ -201,6 +241,34 @@ Marketplace → GET /api/auctions/{id}/current-psbt
 
 ### 3. Purchase Detection Flow
 
+**Primary Path (ZMQ - Real-time):**
+```
+New Transaction (Bitcoin Core)
+         │
+         ▼
+    ZMQ rawtx notification
+         │
+         ▼
+    Parse transaction inputs
+         │
+         ▼
+    Check against monitored UTXOs ──── No match ──→ Ignore
+         │
+         │ Match found
+         ▼
+    Trigger immediate UTXO check
+         │
+         ▼
+    Get spending TX details → Compare with PSBT prices
+         │
+         ▼
+    Match? → sold : closed
+         │
+         ▼
+    Update status in DB (< 1 second total)
+```
+
+**Fallback Path (Polling - Every 5 minutes):**
 ```
 UTXO Monitor → Check if spent → Get spending TX
                     ↓
@@ -226,24 +294,24 @@ UTXO Monitor → Check if spent → Get spending TX
            │ └─────────┐ UTXO spent via PSBT
            │           ↓
            │      ┌────────┐
-           │      │  sold  │  (purchase_txid set, closed_txid null)
+           │      │  sold  │  (spent_txid set, status indicates PSBT match)
            │      └────────┘
            │
            │ UTXO spent not via PSBT
            ↓
       ┌────────┐
-      │ closed │  (closed_txid set, purchase_txid null)
+      │ closed │  (spent_txid set, status indicates non-PSBT spend)
       └────────┘
            
       (if end_block passed and still unspent)
            ↓
       ┌──────────┐
-      │ finished │  (auction ended, no sale, both txids null)
+      │ finished │  (auction ended, no sale, spent_txid null)
       └────┬─────┘
            │ cleanup window expires
            ↓
       ┌──────────┐
-      │ expired  │  (past cleanup window, both txids null)
+      │ expired  │  (past cleanup window, spent_txid null)
       └──────────┘
 ```
 
@@ -298,11 +366,16 @@ The application connects to the existing `counterparty-core_default` network, wh
 # API
 API_KEY=secret-key-here
 
-# Bitcoin Core
+# Bitcoin Core RPC
 BITCOIN_RPC_HOST=bitcoind
 BITCOIN_RPC_PORT=8332
 BITCOIN_RPC_USER=user
 BITCOIN_RPC_PASSWORD=password
+
+# Bitcoin Core ZMQ (real-time notifications)
+ZMQ_ENABLED=true
+ZMQ_BLOCK_URL=tcp://bitcoind:9333   # rawblock notifications
+ZMQ_TX_URL=tcp://bitcoind:9332      # rawtx notifications
 
 # Counterparty Core
 COUNTERPARTY_HOST=counterparty
@@ -310,18 +383,32 @@ COUNTERPARTY_PORT=4000
 
 # Database
 DATABASE_PATH=./data/auctions.db
+
+# Monitoring (fallback polling intervals - ZMQ provides real-time)
+BLOCK_MONITOR_INTERVAL=300   # 5 minutes
+UTXO_MONITOR_INTERVAL=300    # 5 minutes
+```
+
+**Bitcoin Core ZMQ Configuration** (in `bitcoin.conf`):
+```ini
+zmqpubrawtx=tcp://0.0.0.0:9332
+zmqpubhashtx=tcp://0.0.0.0:9332
+zmqpubsequence=tcp://0.0.0.0:9332
+zmqpubrawblock=tcp://0.0.0.0:9333
 ```
 
 ## Performance Considerations
 
 ### 1. Database
-- SQLite for simplicity
+- SQLite for simplicity with WAL mode enabled for better concurrency
 - Indexes on frequently queried fields (status, utxo)
 - Cascading deletes for referential integrity
+- 5-second busy timeout for lock contention handling
 
-### 2. Monitoring Intervals
-- Block monitor: 30 seconds (Bitcoin blocks ~10 minutes)
-- UTXO monitor: 60 seconds (slower check is acceptable)
+### 2. Real-Time Notifications (ZMQ)
+- Block detection: < 1 second via ZMQ `rawblock` subscription
+- UTXO spend detection: < 1 second via ZMQ `rawtx` subscription
+- Fallback polling: Every 5 minutes (catches missed ZMQ messages)
 
 ### 3. API Response Times
 - Auction listing: Fast (DB query only)
@@ -330,16 +417,17 @@ DATABASE_PATH=./data/auctions.db
 
 ## Scalability
 
-### Current Limitations
-- SQLite (single writer)
-- Single instance only
-- No caching layer
+### Current Architecture
+- SQLite with WAL mode (concurrent reads, single writer with retry)
+- Single instance deployment
+- ZMQ for real-time event-driven updates (reduces polling overhead 10x)
+- Handles 100-200 requests/minute comfortably
 
-### Potential Improvements
-- PostgreSQL for multiple writers
-- Redis caching for block height
-- Load balancer for multiple instances
-- Message queue for monitoring jobs
+### Potential Improvements for Higher Scale
+- PostgreSQL for multiple writers and horizontal scaling
+- Redis caching for auction listings and block height
+- Load balancer for multiple API instances
+- Shared ZMQ listener service for multi-instance deployments
 
 ## Testing Strategy
 
@@ -385,6 +473,7 @@ Use provided `test_api.sh` script to:
 - Auction creation rate
 - PSBT revelation requests
 - Bitcoin RPC response times
+- ZMQ connection status and message rates
 - UTXO monitoring failures
 - Database errors
 
@@ -394,7 +483,7 @@ Use provided `test_api.sh` script to:
 2. **Batch Operations**: Submit multiple auctions at once
 3. **Advanced Filtering**: Search by asset, price range, date
 4. **Analytics**: Auction success rates, average prices
-5. **WebSocket**: Real-time auction updates
+5. **WebSocket API**: Real-time auction updates for frontend clients
 6. **Multi-Asset**: Support for asset bundles (if demand exists)
 7. **Auction Extensions**: Allow sellers to extend end_block
 8. **Reserve Prices**: Hidden minimum price support

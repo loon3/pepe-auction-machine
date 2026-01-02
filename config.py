@@ -21,14 +21,18 @@ class Config:
     # Bitcoin Core RPC Configuration
     BITCOIN_RPC_HOST = os.getenv('BITCOIN_RPC_HOST', 'bitcoind')
     BITCOIN_RPC_PORT = int(os.getenv('BITCOIN_RPC_PORT', '8332'))
-    BITCOIN_RPC_USER = os.getenv('BITCOIN_RPC_USER', 'rpc_user')
-    BITCOIN_RPC_PASSWORD = os.getenv('BITCOIN_RPC_PASSWORD', 'rpc_password')
+    BITCOIN_RPC_USER = os.getenv('BITCOIN_RPC_USER', 'rpc')
+    BITCOIN_RPC_PASSWORD = os.getenv('BITCOIN_RPC_PASSWORD', 'rpc')
     
     # Counterparty Core API Configuration
-    COUNTERPARTY_HOST = os.getenv('COUNTERPARTY_HOST', 'counterparty')
-    COUNTERPARTY_PORT = int(os.getenv('COUNTERPARTY_PORT', '4000'))
+    COUNTERPARTY_API_URL = os.getenv('COUNTERPARTY_API_URL', 'https://api.counterparty.io:4000')
     
-    # Monitoring Configuration
-    BLOCK_MONITOR_INTERVAL = int(os.getenv('BLOCK_MONITOR_INTERVAL', '30'))  # seconds
-    UTXO_MONITOR_INTERVAL = int(os.getenv('UTXO_MONITOR_INTERVAL', '60'))  # seconds
+    # Monitoring Configuration (fallback polling intervals - ZMQ provides real-time updates)
+    BLOCK_MONITOR_INTERVAL = int(os.getenv('BLOCK_MONITOR_INTERVAL', '300'))  # 5 min fallback
+    UTXO_MONITOR_INTERVAL = int(os.getenv('UTXO_MONITOR_INTERVAL', '300'))    # 5 min fallback
+    
+    # ZMQ Configuration (Bitcoin Core push notifications)
+    ZMQ_ENABLED = os.getenv('ZMQ_ENABLED', 'true').lower() == 'true'
+    ZMQ_BLOCK_URL = os.getenv('ZMQ_BLOCK_URL', 'tcp://bitcoind:9333')  # rawblock notifications
+    ZMQ_TX_URL = os.getenv('ZMQ_TX_URL', 'tcp://bitcoind:9332')        # rawtx notifications
 

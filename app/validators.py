@@ -209,8 +209,15 @@ def validate_auction_submission(data):
     if not isinstance(data['asset_name'], str):
         raise ValidationError("asset_name must be a string (multiple assets not supported)")
     
-    if not isinstance(data['asset_qty'], int) or data['asset_qty'] <= 0:
-        raise ValidationError("asset_qty must be a positive integer")
+    # asset_qty can be int (indivisible) or float (divisible, up to 8 decimals)
+    if not isinstance(data['asset_qty'], (int, float)) or data['asset_qty'] <= 0:
+        raise ValidationError("asset_qty must be a positive number")
+    
+    # If float, validate decimal places (max 8 for divisible assets)
+    if isinstance(data['asset_qty'], float):
+        decimal_str = str(data['asset_qty']).split('.')
+        if len(decimal_str) > 1 and len(decimal_str[1]) > 8:
+            raise ValidationError("asset_qty can have at most 8 decimal places for divisible assets")
     
     if not isinstance(data['utxo_vout'], int) or data['utxo_vout'] < 0:
         raise ValidationError("utxo_vout must be a non-negative integer")
@@ -221,8 +228,8 @@ def validate_auction_submission(data):
     if not isinstance(data['end_block'], int) or data['end_block'] <= 0:
         raise ValidationError("end_block must be a positive integer")
     
-    if data['end_block'] <= data['start_block']:
-        raise ValidationError("end_block must be greater than start_block")
+    if data['end_block'] < data['start_block']:
+        raise ValidationError("end_block must be greater than or equal to start_block")
     
     # Validate that start_block is in the future
     try:
@@ -248,23 +255,59 @@ def validate_auction_submission(data):
     if not isinstance(data['end_price_sats'], int) or data['end_price_sats'] <= 0:
         raise ValidationError("end_price_sats must be a positive integer")
     
-    if data['end_price_sats'] >= data['start_price_sats']:
-        raise ValidationError("end_price_sats must be less than start_price_sats (Dutch auction)")
+    if not isinstance(data['price_decrement'], int) or data['price_decrement'] < 0:
+        raise ValidationError("price_decrement must be a non-negative integer")
     
-    if not isinstance(data['price_decrement'], int) or data['price_decrement'] <= 0:
-        raise ValidationError("price_decrement must be a positive integer")
+    # Detect fixed-price listing vs Dutch auction
+    is_fixed_price = (
+        data['start_block'] == data['end_block'] and
+        data['start_price_sats'] == data['end_price_sats'] and
+        data['price_decrement'] == 0
+    )
     
-    # Validate that price_decrement is consistent with start/end prices and block range
-    expected_total_decrease = data['start_price_sats'] - data['end_price_sats']
-    num_decrements = data['end_block'] - data['start_block']
-    expected_decrement = expected_total_decrease / num_decrements
-    
-    # Allow for rounding, but price_decrement should be close to expected
-    if abs(data['price_decrement'] - expected_decrement) > num_decrements:
-        raise ValidationError(
-            f"price_decrement ({data['price_decrement']}) doesn't match expected value "
-            f"(~{expected_decrement:.2f} based on price range and block count)"
-        )
+    if is_fixed_price:
+        # Fixed-price listing: all three conditions must be true
+        logger.info(f"Detected fixed-price listing for {data['asset_name']}")
+    else:
+        # Dutch auction: validate typical auction constraints
+        if data['end_price_sats'] >= data['start_price_sats']:
+            # Provide helpful error message if it looks like user intended fixed-price
+            if data['start_block'] == data['end_block']:
+                raise ValidationError(
+                    f"For single-block listings, all three conditions must be true for fixed-price format:\n"
+                    f"  - start_block == end_block: {data['start_block'] == data['end_block']} ✓\n"
+                    f"  - start_price_sats == end_price_sats: {data['start_price_sats'] == data['end_price_sats']} "
+                    f"(start={data['start_price_sats']}, end={data['end_price_sats']})\n"
+                    f"  - price_decrement == 0: {data['price_decrement'] == 0} (decrement={data['price_decrement']})"
+                )
+            raise ValidationError(
+                f"end_price_sats ({data['end_price_sats']}) must be less than start_price_sats ({data['start_price_sats']}) for Dutch auctions"
+            )
+        
+        if data['price_decrement'] <= 0:
+            raise ValidationError("price_decrement must be a positive integer for Dutch auctions")
+        
+        if data['start_block'] == data['end_block']:
+            raise ValidationError("For single-block auctions, must use fixed-price format (start_price = end_price, price_decrement = 0)")
+        
+        # Validate that price_decrement is consistent with start/end prices and block range
+        # Calculate what the final price would be if we apply price_decrement for each block
+        num_blocks = data['end_block'] - data['start_block']
+        calculated_end_price = data['start_price_sats'] - (data['price_decrement'] * num_blocks)
+        
+        # The calculated end price should match the specified end_price_sats
+        # Since desired price range may not divide evenly by num_blocks, allow small tolerance
+        # (at most num_blocks sats of difference, since each block could contribute ±1 sat)
+        price_difference = abs(calculated_end_price - data['end_price_sats'])
+        tolerance = num_blocks
+        
+        if price_difference > tolerance:
+            raise ValidationError(
+                f"price_decrement ({data['price_decrement']}) applied over {num_blocks} blocks "
+                f"results in final price of {calculated_end_price} sats, but end_price_sats is "
+                f"{data['end_price_sats']} sats. Difference of {price_difference} sats exceeds "
+                f"tolerance of {tolerance} sats. Adjust price_decrement, start_price_sats, or end_price_sats."
+            )
     
     if not isinstance(data['psbts'], list) or len(data['psbts']) == 0:
         raise ValidationError("psbts must be a non-empty list")
@@ -316,7 +359,16 @@ def validate_auction_submission(data):
             f"Last PSBT price ({last_psbt['price_sats']}) must match end_price_sats ({data['end_price_sats']})"
         )
     
-    logger.info(f"Successfully validated auction for {data['asset_name']} at {data['utxo_txid']}:{data['utxo_vout']}")
+    # Extract seller address from the UTXO
+    seller_address = bitcoin_rpc.get_address_from_utxo(data['utxo_txid'], data['utxo_vout'])
+    
+    # Add seller to validated data
+    data['seller'] = seller_address
+    
+    if seller_address:
+        logger.info(f"Successfully validated auction for {data['asset_name']} at {data['utxo_txid']}:{data['utxo_vout']} with seller {seller_address}")
+    else:
+        logger.warning(f"Successfully validated auction for {data['asset_name']} at {data['utxo_txid']}:{data['utxo_vout']} but could not determine seller address")
     
     return data
 

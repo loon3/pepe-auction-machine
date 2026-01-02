@@ -14,14 +14,13 @@ class CounterpartyAPIClient:
     def _get_base_url(self):
         """Get Counterparty API base URL"""
         if self.base_url is None:
-            host = current_app.config['COUNTERPARTY_HOST']
-            port = current_app.config['COUNTERPARTY_PORT']
-            self.base_url = f"http://{host}:{port}"
+            api_url = current_app.config['COUNTERPARTY_API_URL']
+            self.base_url = f"{api_url}"
         return self.base_url
     
     def get_utxo_balances(self, txid, vout):
         """
-        Get asset balances attached to a UTXO
+        Get asset balances attached to a UTXO with verbose info
         
         Args:
             txid: Transaction ID
@@ -29,12 +28,12 @@ class CounterpartyAPIClient:
             
         Returns:
             dict with keys:
-                - assets: list of asset dicts (asset, asset_longname, quantity, utxo, utxo_address)
+                - assets: list of asset dicts with asset_info (divisible, description, etc.)
                 - single_asset: boolean indicating if only one asset is attached
                 - error: error message if request failed
         """
         try:
-            url = f"{self._get_base_url()}/v2/utxos/{txid}:{vout}/balances"
+            url = f"{self._get_base_url()}/v2/utxos/{txid}:{vout}/balances?verbose=true"
             
             logger.info(f"Requesting Counterparty balances from: {url}")
             
@@ -71,12 +70,13 @@ class CounterpartyAPIClient:
     def validate_utxo_asset(self, txid, vout, expected_asset_name, expected_quantity):
         """
         Validate that a UTXO has the expected asset and quantity
+        Handles both divisible and indivisible assets
         
         Args:
             txid: Transaction ID
             vout: Output index
             expected_asset_name: Expected asset name (must be a string)
-            expected_quantity: Expected asset quantity
+            expected_quantity: Expected asset quantity (int for indivisible, float for divisible)
             
         Returns:
             dict with keys:
@@ -128,13 +128,29 @@ class CounterpartyAPIClient:
                 'asset_data': asset_data
             }
         
+        # Determine if asset is divisible
+        asset_info = asset_data.get('asset_info', {})
+        is_divisible = asset_info.get('divisible', False)
+        
+        # Get the appropriate quantity based on divisibility
+        if is_divisible:
+            # For divisible assets, use normalized quantity (float with up to 8 decimals)
+            actual_quantity = float(asset_data.get('quantity_normalized', 0))
+            expected_quantity = float(expected_quantity)
+        else:
+            # For indivisible assets, use raw quantity (integer)
+            actual_quantity = asset_data.get('quantity', 0)
+            expected_quantity = int(expected_quantity)
+        
         # Validate quantity
-        if asset_data['quantity'] != expected_quantity:
+        if actual_quantity != expected_quantity:
             return {
                 'valid': False,
-                'error': f"Quantity mismatch. Expected {expected_quantity}, found {asset_data['quantity']}",
+                'error': f"Quantity mismatch. Expected {expected_quantity}, found {actual_quantity} ({'divisible' if is_divisible else 'indivisible'} asset)",
                 'asset_data': asset_data
             }
+        
+        logger.info(f"Asset validation successful: {expected_asset_name} ({expected_quantity} {'divisible' if is_divisible else 'indivisible'} units)")
         
         return {
             'valid': True,

@@ -6,7 +6,7 @@ class Auction(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     asset_name = db.Column(db.String(255), nullable=False)
-    asset_qty = db.Column(db.Integer, nullable=False)
+    asset_qty = db.Column(db.Float, nullable=False)  # Float to support divisible assets (up to 8 decimals)
     utxo_txid = db.Column(db.String(64), nullable=False)
     utxo_vout = db.Column(db.Integer, nullable=False)
     start_block = db.Column(db.Integer, nullable=False)
@@ -16,8 +16,11 @@ class Auction(db.Model):
     price_decrement = db.Column(db.BigInteger, nullable=False)
     blocks_after_end = db.Column(db.Integer, nullable=False, default=144)
     status = db.Column(db.String(20), nullable=False, default='upcoming')  # upcoming, active, sold, closed, finished, expired
-    purchase_txid = db.Column(db.String(64), nullable=True)
-    closed_txid = db.Column(db.String(64), nullable=True)
+    spent_txid = db.Column(db.String(64), nullable=True)  # Transaction that spent the UTXO (context determined by status)
+    spent_block = db.Column(db.Integer, nullable=True)  # Block height when UTXO was spent
+    spent_at = db.Column(db.DateTime, nullable=True)  # Timestamp when UTXO was spent (transaction blocktime)
+    recipient = db.Column(db.String(64), nullable=True)  # Recipient address (first non-OP_RETURN output of spending tx)
+    seller = db.Column(db.String(64), nullable=True)  # Seller address (from PSBT input or UTXO)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     
     # Relationship to PSBTs
@@ -41,8 +44,11 @@ class Auction(db.Model):
             'price_decrement': self.price_decrement,
             'blocks_after_end': self.blocks_after_end,
             'status': self.status,
-            'purchase_txid': self.purchase_txid,
-            'closed_txid': self.closed_txid,
+            'spent_txid': self.spent_txid,
+            'spent_block': self.spent_block,
+            'spent_at': self.spent_at.isoformat() if self.spent_at else None,
+            'recipient': self.recipient,
+            'seller': self.seller,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
         

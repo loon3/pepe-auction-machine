@@ -12,8 +12,6 @@ services:
     networks:
       - counterparty-core_default
     restart: unless-stopped
-    depends_on:
-      - bitcoind
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
       interval: 30s
