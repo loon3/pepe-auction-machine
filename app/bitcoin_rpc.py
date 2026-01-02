@@ -1,6 +1,7 @@
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 from flask import current_app
 import logging
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,7 @@ class BitcoinRPCClient:
         self._connection_url = None
     
     def _get_connection(self):
-        """Get or create RPC connection"""
+        """Get or create RPC connection for single calls"""
         # Always create a fresh connection URL from config
         rpc_user = current_app.config['BITCOIN_RPC_USER']
         rpc_password = current_app.config['BITCOIN_RPC_PASSWORD']
@@ -25,6 +26,69 @@ class BitcoinRPCClient:
         # Create a new connection for each call to avoid thread safety issues
         # AuthServiceProxy connections should not be shared across threads
         return AuthServiceProxy(rpc_url)
+    
+    def _get_rpc_config(self):
+        """Get RPC configuration for direct HTTP calls"""
+        return {
+            'user': current_app.config['BITCOIN_RPC_USER'],
+            'password': current_app.config['BITCOIN_RPC_PASSWORD'],
+            'host': current_app.config['BITCOIN_RPC_HOST'],
+            'port': current_app.config['BITCOIN_RPC_PORT']
+        }
+    
+    def _batch_rpc_call(self, calls):
+        """
+        Execute batch RPC calls using requests library directly.
+        
+        This bypasses python-bitcoinrpc's batch_ method which has compatibility
+        issues with Bitcoin Core v30's response format.
+        
+        Args:
+            calls: List of [method, *params] lists
+            
+        Returns:
+            List of results (in same order as calls)
+            
+        Raises:
+            Exception if batch call fails
+        """
+        config = self._get_rpc_config()
+        url = f"http://{config['host']}:{config['port']}"
+        
+        # Build JSON-RPC batch request
+        batch_request = []
+        for i, call in enumerate(calls):
+            method = call[0]
+            params = call[1:] if len(call) > 1 else []
+            batch_request.append({
+                "jsonrpc": "1.0",
+                "id": i,
+                "method": method,
+                "params": params
+            })
+        
+        # Make HTTP request
+        response = requests.post(
+            url,
+            json=batch_request,
+            auth=(config['user'], config['password']),
+            headers={'Content-Type': 'application/json'},
+            timeout=30
+        )
+        
+        response.raise_for_status()
+        
+        # Parse response
+        results = response.json()
+        
+        # Sort by id to ensure correct order
+        if isinstance(results, list):
+            results.sort(key=lambda x: x.get('id', 0))
+            # Extract just the result values
+            return [r.get('result') for r in results]
+        else:
+            # Single response (shouldn't happen for batch, but handle it)
+            return [results.get('result')]
     
     def get_current_block_height(self):
         """Get current blockchain height"""
@@ -89,7 +153,10 @@ class BitcoinRPCClient:
     
     def check_utxos_batch(self, utxo_list, batch_size=50):
         """
-        Check multiple UTXOs in batches using RPC batch requests
+        Check multiple UTXOs in batches using RPC batch requests.
+        
+        Uses requests library directly for batch calls to ensure compatibility
+        with all Bitcoin Core versions (including v30+).
         
         Args:
             utxo_list: List of (txid, vout) tuples to check
@@ -109,28 +176,28 @@ class BitcoinRPCClient:
             batch = utxo_list[i:i + batch_size]
             
             try:
-                rpc = self._get_connection()
-                
                 # Log which UTXOs are being checked
                 utxo_list_str = ", ".join([f"{txid[:8]}...:{vout}" for txid, vout in batch])
                 logger.info(f"Batch checking {len(batch)} UTXOs: {utxo_list_str}")
                 
-                # Execute batch request using batch_ with list of call lists
-                # Format: [['method_name', param1, param2], ...]
-                # Must be lists, not tuples, because library calls .pop()
+                # Build batch calls: [['gettxout', txid, vout], ...]
                 batch_calls = [['gettxout', txid, vout] for txid, vout in batch]
-                batch_results = rpc.batch_(batch_calls)
+                
+                # Execute batch request using requests library directly
+                # This avoids python-bitcoinrpc's batch_ compatibility issues
+                batch_results = self._batch_rpc_call(batch_calls)
                 
                 # Process results
                 for (txid, vout), result in zip(batch, batch_results):
                     # result is None if UTXO is spent or doesn't exist
                     is_spent = (result is None)
                     results[(txid, vout)] = is_spent
+                
+                logger.debug(f"Batch check completed successfully for {len(batch)} UTXOs")
                     
             except Exception as e:
-                logger.error(f"Error in batch UTXO check: {str(e)}", exc_info=True)
+                logger.warning(f"Batch UTXO check failed: {str(e)}, falling back to individual checks")
                 # Fall back to individual checks for this batch
-                logger.info(f"Falling back to individual checks for batch of {len(batch)} UTXOs")
                 for txid, vout in batch:
                     try:
                         is_spent = self.is_utxo_spent(txid, vout)
